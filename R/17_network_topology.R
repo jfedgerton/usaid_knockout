@@ -1,5 +1,5 @@
 # ==========================================================
-# Build network + node panels, then run Ebola DiD
+# Build network + node panels, then run Haiti earthquake DiD
 # with node-level exposure controls
 # ==========================================================
 
@@ -178,7 +178,7 @@ simulate_donor_withdrawal <- function(g, donor_nodes, scenario = c("direct","dro
 # ----------------------------------------------------------
 # Load networks
 # ----------------------------------------------------------
-all_nets <- list.files(path = "Data/clean_nets", full.names = TRUE, pattern = "Rds")
+all_nets <- list.files(path = "Data/clean_nets", full.names = TRUE, pattern = "\\.(rds|Rds)$")
 all_nets <- all_nets[grepl("crs", all_nets)]
 
 network_attributes_list <- list()
@@ -190,7 +190,7 @@ for (z in seq_along(all_nets)) {
   networks <- network_data$networks
   
   # state abbrev inferred from first network name in this file
-  index_name <- gsub("_(.*)", "", names(networks)[1])
+  index_name <- tolower(gsub("_(.*)", "", names(networks)[1]))
   
   for (i in seq_along(networks)) {
     
@@ -367,3 +367,7 @@ for (z in seq_along(all_nets)) {
 # ----------------------------------------------------------
 network_attributes_df <- bind_rows(network_attributes_list)
 node_attributes_df <- bind_rows(node_attributes_list)
+
+
+saveRDS(network_attributes_df, file = "Data/clean_nets/network_attributes_directed.rds")
+saveRDS(node_attributes_df, file = "Data/clean_nets/node_attributes_directed.rds")
