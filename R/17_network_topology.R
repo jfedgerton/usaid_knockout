@@ -30,9 +30,9 @@ USAID_REGEX <- "United States Agency for International Development|\\bUSAID\\b|U
 BILATERAL_DONORS <- list(
   usaid  = "United States Agency for International Development|\\bUSAID\\b|US AID",
   dfid   = "Department for International Development|\\bDFID\\b|\\bFCDO\\b|Foreign.*Commonwealth.*Development",
-  giz    = "Deutsche Gesellschaft|\\bGIZ\\b|\\bBMZ\\b|German Federal Ministry",
-  jica   = "Japan International Cooperation Agency|\\bJICA\\b",
-  afd    = "Agence Fran.aise de D.veloppement|\\bAFD\\b",
+  giz    = "Deutsche Gesellschaft|\\bGIZ\\b|\\bBMZ\\b|German Federal Ministry|Federal Ministry for Economic Cooperation.*Germany",
+  jica   = "Japan(ese)? International Cooperation|\\bJICA\\b",
+  afd    = "Agence Fran.aise de D.veloppement|\\bAFD\\b|French Development Agency",
   sida   = "Swedish International Development|\\bSida\\b|\\bSIDA\\b",
   cida   = "Canadian International Development|\\bCIDA\\b|Global Affairs Canada",
   norad  = "Norwegian Agency for Development|\\bNorad\\b|\\bNORAD\\b"
