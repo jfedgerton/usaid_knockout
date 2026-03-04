@@ -1,0 +1,5 @@
+Unique actors (pooled): 565
+Total network-year snapshots: 16
+Total edges across snapshots: 3,240
+Years covered: 2005–2020
+Shock year used for pre/post summaries: 2010

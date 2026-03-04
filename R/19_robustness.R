@@ -73,7 +73,7 @@ dv_list <- c(
   "fragmentation",
   "weighted_fragmentation",
   "modularity",
-  "density",
+  # "density",   # REMOVED: not a manuscript DV (descriptive only)
   "network_efficiency",
   "mean_distance",
   "donor_concentration",
@@ -88,7 +88,7 @@ dv_list <- c(
 )
 
 # For computationally heavy checks, restrict to headline outcomes:
-dv_focus <- c("fragmentation", "weighted_fragmentation", "modularity", "density")
+dv_focus <- c("fragmentation", "weighted_fragmentation", "usaid_n_partners")
 
 # Random-drop stress test settings
 set.seed(123)
@@ -876,7 +876,7 @@ perm_out_dir <- file.path(out_dir, "permutation_by_window")
 dir.create(perm_out_dir, showWarnings = FALSE, recursive = TRUE)
 
 # Choose DVs for permutation (recommend core ones)
-perm_dvs <- c("fragmentation", "weighted_fragmentation", "density", "modularity",
+perm_dvs <- c("fragmentation", "weighted_fragmentation", "modularity",
               "usaid_frag_delta_drop_unfunded", "usaid_n_partners")
 
 # Windows (match main script)
@@ -1094,3 +1094,456 @@ for (dv in alt_dvs) {
 
 alt_df <- dplyr::bind_rows(alt_rows)
 readr::write_csv(alt_df, file.path(alt_out_dir, "alt_post_timing_pooled_did.csv"))
+
+
+# ##############################################################
+# ==============================================================
+# NODE-LEVEL ROBUSTNESS CHECKS
+# ==============================================================
+# Parallels the network-level checks above for the node-level
+# DiD design described in 18_haiti_earthquake.R.
+#
+# Checks:
+#   K) Node-level event study (pre-trends)
+#   L) Node-level window sensitivity
+#   M) Full vs balanced panel comparison
+#   N) Node-level leave-one-out controls
+#   O) Alternative exposure definitions
+#   P) Node-level cluster bootstrap (org-level)
+# ##############################################################
+
+node_out_dir <- file.path(out_dir, "node_level")
+dir.create(node_out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(node_out_dir, "plots"), showWarnings = FALSE, recursive = TRUE)
+
+# ----------------------------------------------------------
+# Load node data and construct balanced panel
+# ----------------------------------------------------------
+nodes <- readRDS("Data/clean_nets/node_attributes_directed.rds")
+nodes$state <- tolower(nodes$state)
+
+# Balanced panel: orgs present in at least one pre AND one post year
+pre_orgs_r  <- unique(nodes[nodes$year < event_year, c("state", "node_name")])
+post_orgs_r <- unique(nodes[nodes$year >= event_year, c("state", "node_name")])
+balanced_orgs_r <- merge(pre_orgs_r, post_orgs_r, by = c("state", "node_name"))
+nodes_bal <- merge(nodes, balanced_orgs_r, by = c("state", "node_name"))
+
+nodes_bal$treated <- as.integer(nodes_bal$state == treated_state)
+nodes_bal$post    <- as.integer(nodes_bal$year >= event_year)
+nodes_bal$tp      <- nodes_bal$treated * nodes_bal$post
+nodes_bal$org_id  <- paste0(nodes_bal$state, "||", nodes_bal$node_name)
+nodes_bal$rel_year <- nodes_bal$year - event_year
+
+cat("\nNode balanced panel:", nrow(balanced_orgs_r), "org-state pairs,",
+    nrow(nodes_bal), "total rows\n")
+
+# Pre-treatment exposure variables
+nodes_pre_r <- nodes_bal[nodes_bal$year < event_year, ]
+
+pre_usaid_funded_r <- aggregate(usaid_funded ~ state + node_name,
+  data = nodes_pre_r, FUN = max, na.rm = TRUE)
+names(pre_usaid_funded_r)[3] <- "pre_usaid_funded"
+
+pre_exposure_r <- aggregate(usaid_exposure_share ~ state + node_name,
+  data = nodes_pre_r, FUN = mean, na.rm = TRUE)
+names(pre_exposure_r)[3] <- "pre_usaid_exposure_share"
+
+pre_tied_r <- aggregate(tied_to_usaid ~ state + node_name,
+  data = nodes_pre_r, FUN = max, na.rm = TRUE)
+names(pre_tied_r)[3] <- "pre_tied_to_usaid"
+
+nodes_bal <- merge(nodes_bal, pre_usaid_funded_r, by = c("state", "node_name"), all.x = TRUE)
+nodes_bal <- merge(nodes_bal, pre_exposure_r,     by = c("state", "node_name"), all.x = TRUE)
+nodes_bal <- merge(nodes_bal, pre_tied_r,         by = c("state", "node_name"), all.x = TRUE)
+
+# Exclude states from main node pool
+nodes_bal_main <- nodes_bal[!nodes_bal$state %in% exclude_main, ]
+
+# Node DVs
+node_dv_list <- c("in_degree", "n_funders", "sole_usaid_funded",
+                   "n_non_usaid_funders", "total_degree",
+                   "rewire_in", "rewire_out")
+node_dv_list <- node_dv_list[node_dv_list %in% names(nodes_bal)]
+
+# Headline DVs for expensive checks
+node_dv_focus <- c("in_degree", "sole_usaid_funded", "n_funders")
+node_dv_focus <- node_dv_focus[node_dv_focus %in% names(nodes_bal)]
+
+cat("Node DVs:", paste(node_dv_list, collapse = ", "), "\n")
+cat("Node DVs (focus):", paste(node_dv_focus, collapse = ", "), "\n")
+
+
+# ==========================================================
+# K) Node-level event study (pre-trends)
+# ==========================================================
+cat("\n=== K) Node-level event study ===\n")
+node_es_rows <- list()
+node_lead_tests <- list()
+
+for (dv in node_dv_list) {
+  dat <- nodes_bal_main[!is.na(nodes_bal_main[[dv]]), ]
+
+  fit_es <- tryCatch(
+    feols(as.formula(paste0(dv, " ~ i(rel_year, treated, ref = -1) | org_id + year")),
+          data = dat, cluster = ~org_id),
+    error = function(e) NULL
+  )
+  if (is.null(fit_es)) next
+
+  ct <- as.data.frame(coeftable(fit_es))
+  ct$term <- rownames(ct)
+  rownames(ct) <- NULL
+
+  ct <- ct[grepl("^rel_year::", ct$term), ]
+  rel_raw <- ct$term
+  rel_raw <- sub("^rel_year::", "", rel_raw)
+  rel_raw <- sub("(:treated|#treated)$", "", rel_raw)
+  ct$rel_year <- suppressWarnings(as.integer(rel_raw))
+  ct$dep_var <- dv
+
+  node_es_rows[[length(node_es_rows) + 1]] <- ct
+
+  # Joint test of leads (rel_year <= -2)
+  lead_terms <- ct$term[!is.na(ct$rel_year) & ct$rel_year <= -2]
+  lead_terms <- lead_terms[lead_terms %in% names(coef(fit_es))]
+  lead_df <- length(lead_terms)
+
+  lead_stat <- NA_real_
+  lead_p <- NA_real_
+
+  if (lead_df > 0) {
+    V <- tryCatch(vcov(fit_es)[lead_terms, lead_terms, drop = FALSE],
+                  error = function(e) NULL)
+    if (!is.null(V)) {
+      w <- safe_wald_chisq(coef(fit_es)[lead_terms], V, tol = 1e-10)
+      lead_stat <- w$stat
+      lead_p <- w$p
+      lead_df <- w$df
+    }
+  }
+
+  node_lead_tests[[length(node_lead_tests) + 1]] <- data.frame(
+    dep_var = dv, n_leads = lead_df,
+    wald_stat = lead_stat, p_value = lead_p,
+    stringsAsFactors = FALSE
+  )
+
+  cat("  ", dv, ": lead test p =", round(lead_p, 4), "\n")
+}
+
+node_es_coefs <- bind_rows(node_es_rows)
+node_es_leads <- bind_rows(node_lead_tests)
+
+write_csv(node_es_coefs, file.path(node_out_dir, "node_eventstudy_coefs.csv"))
+write_csv(node_es_leads, file.path(node_out_dir, "node_eventstudy_leads_joint_test.csv"))
+
+# Event study plots
+for (dv in unique(node_es_coefs$dep_var)) {
+  pdat <- node_es_coefs[node_es_coefs$dep_var == dv & !is.na(node_es_coefs$rel_year), ]
+  if (nrow(pdat) == 0) next
+
+  names(pdat)[names(pdat) == "Estimate"] <- "est"
+  names(pdat)[names(pdat) == "Std. Error"] <- "se_val"
+
+  if (!all(c("est", "se_val") %in% names(pdat))) next
+
+  pdat$lb_es <- pdat$est - 1.96 * pdat$se_val
+  pdat$ub_es <- pdat$est + 1.96 * pdat$se_val
+
+  p <- ggplot(pdat, aes(x = rel_year, y = est)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = -0.5, linetype = "dotted", color = "grey50") +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = lb_es, ymax = ub_es), width = 0.3) +
+    theme_classic() +
+    labs(title = paste0("Node-level event study: ", dv),
+         x = "Years relative to 2010", y = "Coefficient")
+  ggsave(file.path(node_out_dir, "plots", paste0("node_es_", dv, ".png")),
+         p, width = 8, height = 5)
+}
+
+
+# ==========================================================
+# L) Node-level window sensitivity
+# ==========================================================
+cat("\n=== L) Node-level window sensitivity ===\n")
+node_win_rows <- list()
+
+for (dv in node_dv_focus) {
+  for (pre_w in pre_grid) {
+    for (post_w in post_grid) {
+      yr_range <- (event_year - pre_w):(event_year + post_w)
+      dat <- nodes_bal_main[nodes_bal_main$year %in% yr_range & !is.na(nodes_bal_main[[dv]]), ]
+
+      fit <- tryCatch(
+        feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+              data = dat, cluster = ~org_id),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) next
+      if (!("tp" %in% names(coef(fit)))) next
+
+      node_win_rows[[length(node_win_rows) + 1]] <- data.frame(
+        dep_var   = dv,
+        pre_w     = pre_w,
+        post_w    = post_w,
+        estimate  = as.numeric(coef(fit)["tp"]),
+        std_error = as.numeric(se(fit)["tp"]),
+        p_value   = as.numeric(pvalue(fit)["tp"]),
+        n         = nobs(fit),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+node_win_sens <- bind_rows(node_win_rows)
+write_csv(node_win_sens, file.path(node_out_dir, "node_window_sensitivity.csv"))
+
+# Heatmap plots
+for (dv in unique(node_win_sens$dep_var)) {
+  pdat <- node_win_sens[node_win_sens$dep_var == dv, ]
+  pdat$pre_w  <- factor(pdat$pre_w,  levels = sort(unique(pdat$pre_w)))
+  pdat$post_w <- factor(pdat$post_w, levels = sort(unique(pdat$post_w)))
+
+  g <- ggplot(pdat, aes(x = post_w, y = pre_w, fill = estimate)) +
+    geom_tile() +
+    labs(title = paste0("Node-level window sensitivity: ", dv),
+         x = "Post window", y = "Pre window")
+  ggsave(file.path(node_out_dir, "plots", paste0("node_win_sens_", dv, ".png")),
+         g, width = 8, height = 6)
+}
+
+
+# ==========================================================
+# M) Full (unbalanced) vs balanced panel comparison
+# ==========================================================
+cat("\n=== M) Full vs balanced panel comparison ===\n")
+nodes_full <- nodes[!nodes$state %in% exclude_main, ]
+nodes_full$treated <- as.integer(nodes_full$state == treated_state)
+nodes_full$post    <- as.integer(nodes_full$year >= event_year)
+nodes_full$tp      <- nodes_full$treated * nodes_full$post
+nodes_full$org_id  <- paste0(nodes_full$state, "||", nodes_full$node_name)
+
+panel_comp_rows <- list()
+
+for (dv in node_dv_focus) {
+  # Balanced panel estimate
+  dat_b <- nodes_bal_main[!is.na(nodes_bal_main[[dv]]), ]
+  fit_b <- tryCatch(
+    feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+          data = dat_b, cluster = ~org_id),
+    error = function(e) NULL
+  )
+
+  # Full (unbalanced) panel estimate
+  dat_f <- nodes_full[!is.na(nodes_full[[dv]]), ]
+  fit_f <- tryCatch(
+    feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+          data = dat_f, cluster = ~org_id),
+    error = function(e) NULL
+  )
+
+  if (!is.null(fit_b) && "tp" %in% names(coef(fit_b))) {
+    panel_comp_rows[[length(panel_comp_rows) + 1]] <- data.frame(
+      dep_var = dv, panel = "balanced",
+      estimate  = as.numeric(coef(fit_b)["tp"]),
+      std_error = as.numeric(se(fit_b)["tp"]),
+      p_value   = as.numeric(pvalue(fit_b)["tp"]),
+      n = nobs(fit_b), n_orgs = length(unique(dat_b$org_id)),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  if (!is.null(fit_f) && "tp" %in% names(coef(fit_f))) {
+    panel_comp_rows[[length(panel_comp_rows) + 1]] <- data.frame(
+      dep_var = dv, panel = "full_unbalanced",
+      estimate  = as.numeric(coef(fit_f)["tp"]),
+      std_error = as.numeric(se(fit_f)["tp"]),
+      p_value   = as.numeric(pvalue(fit_f)["tp"]),
+      n = nobs(fit_f), n_orgs = length(unique(dat_f$org_id)),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+panel_comp <- bind_rows(panel_comp_rows)
+write_csv(panel_comp, file.path(node_out_dir, "node_balanced_vs_full_panel.csv"))
+cat("Panel comparison:\n")
+print(panel_comp)
+
+
+# ==========================================================
+# N) Node-level leave-one-out controls
+# ==========================================================
+cat("\n=== N) Node-level leave-one-out ===\n")
+node_loo_rows <- list()
+node_controls <- setdiff(sort(unique(nodes_bal_main$state)), treated_state)
+
+for (dv in node_dv_focus) {
+  # Baseline
+  dat_base <- nodes_bal_main[!is.na(nodes_bal_main[[dv]]), ]
+  fit_base <- tryCatch(
+    feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+          data = dat_base, cluster = ~org_id),
+    error = function(e) NULL
+  )
+  if (is.null(fit_base)) next
+  base_est <- as.numeric(coef(fit_base)["tp"])
+
+  for (s in node_controls) {
+    dat_loo <- dat_base[dat_base$state != s, ]
+    fit_loo <- tryCatch(
+      feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+            data = dat_loo, cluster = ~org_id),
+      error = function(e) NULL
+    )
+    if (is.null(fit_loo)) next
+    if (!("tp" %in% names(coef(fit_loo)))) next
+
+    node_loo_rows[[length(node_loo_rows) + 1]] <- data.frame(
+      dep_var       = dv,
+      dropped_state = s,
+      estimate      = as.numeric(coef(fit_loo)["tp"]),
+      std_error     = as.numeric(se(fit_loo)["tp"]),
+      base_estimate = base_est,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+node_loo_df <- bind_rows(node_loo_rows)
+write_csv(node_loo_df, file.path(node_out_dir, "node_leave_one_out.csv"))
+
+
+# ==========================================================
+# O) Alternative exposure definitions
+# ==========================================================
+# Test whether results are sensitive to how we define USAID
+# exposure at the node level. Compare:
+#   (1) pre_usaid_funded (direct: USAID out-neighbor)
+#   (2) pre_tied_to_usaid (any-mode neighbor of USAID)
+#   (3) pre_usaid_exposure_share (continuous: share of neighbors connected)
+cat("\n=== O) Alternative exposure definitions ===\n")
+alt_exp_rows <- list()
+
+exposure_vars <- c("pre_usaid_funded", "pre_tied_to_usaid", "pre_usaid_exposure_share")
+exposure_vars <- exposure_vars[exposure_vars %in% names(nodes_bal_main)]
+
+for (dv in node_dv_focus) {
+  dat <- nodes_bal_main[!is.na(nodes_bal_main[[dv]]), ]
+
+  for (ev in exposure_vars) {
+    # Interaction with tp
+    fml <- as.formula(paste0(dv, " ~ tp + tp:", ev, " | org_id + year"))
+    fit <- tryCatch(
+      feols(fml, data = dat, cluster = ~org_id),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+
+    for (cf in names(coef(fit))) {
+      alt_exp_rows[[length(alt_exp_rows) + 1]] <- data.frame(
+        dep_var       = dv,
+        exposure_var  = ev,
+        term          = cf,
+        estimate      = as.numeric(coef(fit)[cf]),
+        std_error     = as.numeric(se(fit)[cf]),
+        p_value       = as.numeric(pvalue(fit)[cf]),
+        n             = nobs(fit),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+alt_exp_df <- bind_rows(alt_exp_rows)
+write_csv(alt_exp_df, file.path(node_out_dir, "node_alternative_exposure_defs.csv"))
+
+
+# ==========================================================
+# P) Node-level cluster bootstrap (org-level resampling)
+# ==========================================================
+# Parallels section H but at the node level.
+# Resamples organizations (clusters) within each state, preserving
+# the state-level treatment structure.
+cat("\n=== P) Node-level cluster bootstrap ===\n")
+
+node_boot_B <- 999
+node_boot_min_success <- 200
+
+node_boot_rows <- list()
+
+for (dv in node_dv_focus) {
+  dat <- nodes_bal_main[!is.na(nodes_bal_main[[dv]]), ]
+
+  fit <- tryCatch(
+    feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+          data = dat, cluster = ~org_id),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) next
+
+  beta_hat <- as.numeric(coef(fit)["tp"])
+
+  # Get list of orgs by state for stratified resampling
+  orgs_by_state <- split(unique(dat$org_id), dat$state[match(unique(dat$org_id), dat$org_id)])
+
+  b_vals <- rep(NA_real_, node_boot_B)
+  failures <- 0L
+
+  for (b_i in seq_len(node_boot_B)) {
+    # Stratified resample: within each state, resample orgs with replacement
+    boot_orgs <- character(0)
+    for (st in names(orgs_by_state)) {
+      st_orgs <- orgs_by_state[[st]]
+      boot_orgs <- c(boot_orgs, sample(st_orgs, length(st_orgs), replace = TRUE))
+    }
+
+    # Build multiplicity weights
+    org_counts <- table(boot_orgs)
+    w <- as.numeric(org_counts[dat$org_id])
+    w[is.na(w)] <- 0
+
+    fit_b <- tryCatch(
+      feols(as.formula(paste0(dv, " ~ tp | org_id + year")),
+            data = dat, weights = w),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_b) || is.na(coef(fit_b)["tp"])) {
+      failures <- failures + 1L
+      next
+    }
+
+    b_vals[b_i] <- as.numeric(coef(fit_b)["tp"])
+  }
+
+  b_vals <- b_vals[is.finite(b_vals)]
+  if (length(b_vals) < node_boot_min_success) next
+
+  ci <- quantile(b_vals, probs = c(0.025, 0.975), na.rm = TRUE)
+  p_boot <- mean(abs(b_vals - beta_hat) >= abs(beta_hat), na.rm = TRUE)
+
+  node_boot_rows[[length(node_boot_rows) + 1]] <- data.frame(
+    dep_var          = dv,
+    beta_hat         = beta_hat,
+    p_boot_two_sided = p_boot,
+    ci_lo            = ci[[1]],
+    ci_hi            = ci[[2]],
+    B_requested      = node_boot_B,
+    B_used           = length(b_vals),
+    fail_rate        = failures / node_boot_B,
+    stringsAsFactors = FALSE
+  )
+
+  cat("  ", dv, ": beta =", round(beta_hat, 4),
+      " boot p =", round(p_boot, 4),
+      " CI = [", round(ci[[1]], 4), ",", round(ci[[2]], 4), "]\n")
+}
+
+node_boot_out <- bind_rows(node_boot_rows)
+write_csv(node_boot_out, file.path(node_out_dir, "node_cluster_bootstrap.csv"))
+
+
+cat("\n=== All robustness checks complete (network + node level) ===\n")
